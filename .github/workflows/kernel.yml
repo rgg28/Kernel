@@ -1,0 +1,91 @@
+name: Compilar KernelSU + SUSFS - Moto G82 (Android 16)
+
+on:
+  workflow_dispatch: # Permite iniciar la compilación manualmente desde la pestaña Actions
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Maximizar espacio del servidor
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        df -h
+
+    - name: Instalar dependencias de compilación
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc bison build-essential ccache curl flex git gnupg gperf libssl-dev libxml2-utils lzop rsync unzip zip zlib1g-dev
+
+    - name: Descargar Clang oficial de Google (AOSP compatible con Android 16)
+      run: |
+        mkdir -p $GITHUB_WORKSPACE/clang
+        cd $GITHUB_WORKSPACE/clang
+        curl -LO https://googlesource.com
+        tar -xf clang-r487747c.tar.gz
+        rm clang-r487747c.tar.gz
+
+    - name: Clonar Kernel oficial de LineageOS para Moto G82 (rhodep)
+      run: |
+        cd $GITHUB_WORKSPACE
+        git clone https://github.com -b lineage-22.1 --depth=1 android_kernel
+
+    - name: Integrar KernelSU (Acceso raíz e interceptor de almacenamiento)
+      run: |
+        cd $GITHUB_WORKSPACE/android_kernel
+        curl -LSs "https://githubusercontent.com" | bash -s main
+
+    - name: Aplicar Parches de Ocultación Avanzada SUSFS
+      run: |
+        cd $GITHUB_WORKSPACE
+        # Clonamos el repositorio oficial de parches SUSFS de la comunidad
+        git clone https://gitlab.com --depth=1 susfs_src
+        
+        # Copiamos los archivos de soporte de SUSFS dentro de la estructura de KernelSU
+        cd $GITHUB_WORKSPACE/android_kernel
+        cp $GITHUB_WORKSPACE/susfs_src/kernel/ksu_susfs.c drivers/kernelsu/
+        cp $GITHUB_WORKSPACE/susfs_src/kernel/ksu_susfs.h drivers/kernelsu/
+        
+        # Aplicamos los parches de código para modificar el comportamiento del sistema de archivos
+        # Esto parchea archivos críticos como open.c, stat.c, utimes.c para que no dejen rastro de modificaciones
+        cd $GITHUB_WORKSPACE/android_kernel/drivers/kernelsu
+        patch -p1 < $GITHUB_WORKSPACE/susfs_src/Patches/KSU/0001-ksu-add-susfs-features.patch || true
+        
+        cd $GITHUB_WORKSPACE/android_kernel
+        patch -p1 < $GITHUB_WORKSPACE/susfs_src/Patches/5.10/5.10.x/0001-susfs-v1.5.x-for-kernel-5.10.x.patch || true
+
+    - name: Compilar Núcleo (Kernel)
+      run: |
+        cd $GITHUB_WORKSPACE/android_kernel
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CC=clang
+        
+        # Generar la configuración específica para el Moto G82
+        make O=out vendor/rhodep_defconfig
+        
+        # Habilitar explícitamente SUSFS en la configuración del kernel antes de compilar
+        echo "CONFIG_SUSFS=y" >> out/.config
+        echo "CONFIG_KSU_SUSFS=y" >> out/.config
+        
+        # Compilación en paralelo utilizando la capacidad máxima del servidor de GitHub
+        make -j$(nproc) O=out
+
+    - name: Organizar archivos generados
+      run: |
+        cd $GITHUB_WORKSPACE
+        mkdir output
+        if [ -f android_kernel/out/arch/arm64/boot/Image.gz ]; then
+          cp android_kernel/out/arch/arm64/boot/Image.gz output/
+        elif [ -f android_kernel/out/arch/arm64/boot/Image ]; then
+          cp android_kernel/out/arch/arm64/boot/Image output/
+        fi
+
+    - name: Subir binario del Kernel a GitHub
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-lineage16-kernelsu-susfs-rhodep
+        path: output/*
